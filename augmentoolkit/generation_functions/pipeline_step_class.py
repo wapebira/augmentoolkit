@@ -60,10 +60,32 @@ class PipelineStep:
     def read_previous_output(self, idx, output_list):
         save_path_file = self.make_save_path_file(idx)
         if os.path.exists(save_path_file):
-            with open(save_path_file, "r") as f:
-                output_data = json.load(f)
-            output_list.append(output_data)
-            return True
+            try:
+                # First try UTF-8
+                with open(save_path_file, "r", encoding='utf-8') as f:
+                    output_data = json.load(f)
+                    output_list.append(output_data)
+                    return True
+            except UnicodeDecodeError:
+                # If UTF-8 fails, try with 'utf-8-sig' to handle BOM
+                try:
+                    with open(save_path_file, "r", encoding='utf-8-sig') as f:
+                        output_data = json.load(f)
+                        output_list.append(output_data)
+                        return True
+                except UnicodeDecodeError:
+                    # If that fails too, try with errors='replace'
+                    try:
+                        with open(save_path_file, "r", encoding='utf-8', errors='replace') as f:
+                            output_data = json.load(f)
+                            output_list.append(output_data)
+                            return True
+                    except Exception as e:
+                        print(f"Error reading file {save_path_file}: {str(e)}")
+                        return False
+            except Exception as e:
+                print(f"Error reading file {save_path_file}: {str(e)}")
+                return False
         return False
 
     
@@ -108,7 +130,7 @@ class PipelineStep:
         write_output_to_file(full_output, self.intermediate_output_path_full, id)
         
         os.makedirs(self.save_path, exist_ok=True)
-        with open(save_path_file, "w") as f:
+        with open(save_path_file, "w", encoding='utf-8') as f:
             f.write(json.dumps(output_data, ensure_ascii=False))
         
         output_list.append(output_data)

@@ -2,6 +2,7 @@ import random
 from bs4 import BeautifulSoup
 from logging import INFO
 import os
+import datetime
 import json
 import re
 import sys
@@ -21,6 +22,7 @@ import traceback
 import glob
 import yaml
 from datasets import load_dataset
+import ruamel.yaml
 
 
 from augmentoolkit.utils.create_conv_starter import create_conv_starter
@@ -35,8 +37,10 @@ from augmentoolkit.generation_functions import (
 from augmentoolkit.generation_functions.generation_step_class import GenerationStep
 from augmentoolkit.generation_functions.special_instructions import special_instructions
 
+from augmentoolkit.utils.find_relevant_pos import analyze_responses
+
 config_path = os.environ["CONFIG_PATH"]
-with open(config_path, "r") as file:
+with open(config_path, "r", encoding='utf-8') as file:
     obj_conf = yaml.safe_load(file)
 
 def parse_bool(value):
@@ -66,7 +70,6 @@ SKIP_QUESTION_CHECK = parse_bool(obj_conf["SKIP"]["QUESTION_CHECK"])
 SKIP_CONVERSATION_GENERATION = parse_bool(obj_conf["SKIP"]["CONVERSATION_GENERATION"]) # useful if you're generating "tight" data only.
 FINAL_ASSISTANT_PROMPTS_NO_RAG = obj_conf["SYSTEM"]["FINAL_ASSISTANT_PROMPTS_NO_RAG"]
 FINAL_ASSISTANT_PROMPTS_RAG = obj_conf["SYSTEM"]["FINAL_ASSISTANT_PROMPTS_RAG"]
-RAG_FAILURE_PERCENTAGE = obj_conf["SYSTEM"]["RAG_FAILURE_PERCENTAGE"]
 
 
 has_pushed_yet = False
@@ -96,13 +99,13 @@ def convert_logging_to_dataset(input_pth=None, output_pth=None):
         raise Exception("ERROR!! Trying to convert a logging directory to a dataset, when that directory does not exist!")
         
     full_list_of_dicts = []
-    with open(output_file_path, "w") as f:
+    with open(output_file_path, "w", encoding='utf-8') as f:
         existing_files = glob.glob(
             os.path.join(output_dir, "*.yaml")
         )
         
         for file in existing_files:
-            with open(file,'r') as file2:
+            with open(file,'r', encoding='utf-8') as file2:
                 file_list_of_dicts = yaml.safe_load(file2)
             # print(file_list_of_dicts)
             
@@ -112,15 +115,15 @@ def convert_logging_to_dataset(input_pth=None, output_pth=None):
             
             json_to_write = {"conversations": [sysprompt, input, output]}
             
-            f.write(json.dumps(json_to_write, ensure_ascii=False) + "\n")
+            f.write(json.dumps(json_to_write, ensure_ascii=True) + "\n")
             full_list_of_dicts.append(json_to_write)
     print("...Converted successfully (we think)")
     
     dataset_with_split_output_file_path = os.path.join(obj_conf["PATH"]["OUTPUT"], output_pth + "_DATAGEN_OUTPUT_SPLIT.json")
-    with open(dataset_with_split_output_file_path, "w") as f:
+    with open(dataset_with_split_output_file_path, "w", encoding='utf-8') as f:
             json_to_write = {"train": full_list_of_dicts}
             
-            f.write(json.dumps(json_to_write, ensure_ascii=False) + "\n")
+            f.write(json.dumps(json_to_write, ensure_ascii=True) + "\n")
             
     
     if PUSH_TO_HUB:
@@ -154,7 +157,7 @@ def convert_revised_questions_to_question_generation_training(qa_dicts_by_text, 
             question_generation_prompt = os.path.join(DEFAULT_PROMPTS, "qatuples_gen_no_filenames.yaml")
 
     
-    with open(question_generation_prompt, "r") as f:
+    with open(question_generation_prompt, "r", encoding='utf-8') as f:
         qgen_prompt_full = yaml.safe_load(f)
         
         sysprompt = qgen_prompt_full[0]["content"]
@@ -162,7 +165,7 @@ def convert_revised_questions_to_question_generation_training(qa_dicts_by_text, 
     
     # revised_questions_output_path = os.path.join(obj_conf["PATH"]["OUTPUT"], "qatuples_revised")
     convos = []
-    with open(output_file_path, 'w') as out_file:
+    with open(output_file_path, 'w', encoding='utf-8') as out_file:
         for qadict_group in qa_dicts_by_text:
             answer = qadict_group['question_answer_pairs_string']
             text = qadict_group['dict_list'][0]['paragraph']
@@ -184,11 +187,11 @@ def convert_revised_questions_to_question_generation_training(qa_dicts_by_text, 
     if PUSH_TO_HUB: ## IMPORTANT STUFF FOR YOU BEGINS HERE ##
         # temporarily create a json file with splits to load the dataset from
         output_file_path = os.path.join(obj_conf["PATH"]["OUTPUT"], "questions_generation_dataset_split.json")
-        with open(output_file_path, 'w') as out_file_json:
+        with open(output_file_path, 'w', encoding='utf-8') as out_file_json:
             json.dump({"train": convos},out_file_json)
         dataset = load_dataset("json", data_files=output_file_path, split="train") # THIS APPROACH WORKS!
         
-        with open(output_file_path[:-1], 'w') as out_file_json:
+        with open(output_file_path[:-1], 'w', encoding='utf-8') as out_file_json:
             json.dump(convo,out_file_json)
         dataset.to_parquet(f"hf://datasets/{HUB_PATH}/data/train-qgen.parquet")
         os.remove(output_file_path)
@@ -287,23 +290,48 @@ class ContextRepairer(PipelineStep):
         
     def read_previous_output(self, idx, output_list):
         save_path_file = self.make_save_path_file(idx)
-        
         if os.path.exists(save_path_file):
-            with open(save_path_file, "r") as f:
-                content = f.read()  # Read the file once and store its content
-                print(save_path_file)
-                if content == "failed":
-                    print("Loaded failed file")
-                    output_list[idx] = None
-                    return True
-                print("Loaded file:")
-                print(content)
+            try:
+                # First try reading in binary mode
+                with open(save_path_file, 'rb') as f:
+                    content = f.read()
+                    
+                # Try different decodings of the binary content
+                for encoding in ['utf-8', 'utf-8-sig', 'latin1', 'cp1252']:
+                    try:
+                        decoded_content = content.decode(encoding, errors='replace')
+                        if decoded_content == "failed":
+                            print("Loaded failed file")
+                            output_list[idx] = None
+                            return True
+                            
+                        try:
+                            data = json.loads(decoded_content)
+                            output_list[idx] = data
+                            print(f"Successfully loaded file using {encoding} encoding")
+                            return True
+                        except json.JSONDecodeError:
+                            continue
+                            
+                    except UnicodeDecodeError:
+                        continue
+                        
+                # If we get here, none of the decodings worked properly
+                print(f"Warning: Using fallback decoding for {save_path_file}")
+                # Use 'replace' mode with cp1252 as last resort
+                decoded_content = content.decode('cp1252', errors='replace')
                 try:
-                    data = json.loads(content)  # Convert the string back to JSON
+                    data = json.loads(decoded_content)
                     output_list[idx] = data
                     return True
-                except json.JSONDecodeError:
-                    print("JSON decode error with the contents:", content)
+                except json.JSONDecodeError as e:
+                    print(f"Failed to parse JSON after decoding: {str(e)}")
+                    return False
+                    
+            except Exception as e:
+                print(f"Error reading file {save_path_file}: {str(e)}")
+                return False
+                
         return False
     
     def save(self, result=None, full_output=None, idx=None, output_list=None, input_data=None):
@@ -321,10 +349,10 @@ class ContextRepairer(PipelineStep):
         
         os.makedirs(self.save_path_dir, exist_ok=True)
         if output_list[idx]:
-            with open(self.make_save_path_file(idx), "w") as f:
+            with open(self.make_save_path_file(idx), "w", encoding='utf-8') as f:
                 f.write(json.dumps(output_list[idx], ensure_ascii=False))
         else:
-            with open(self.make_save_path_file(idx), "w") as f:
+            with open(self.make_save_path_file(idx), "w", encoding='utf-8') as f:
                 f.write("failed")
     
 context_repairer = ContextRepairer()
@@ -456,7 +484,7 @@ async def vet_answer_accuracy_loop(
             return qa_dict
         else:
             print("Answer accuracy validation failed! Tossing")
-            with open(file_path, "w") as file:
+            with open(file_path, "w", encoding='utf-8') as file:
                     file.write("failed")
             return
     except Exception as e:
@@ -464,7 +492,7 @@ async def vet_answer_accuracy_loop(
         print(e)
         traceback.print_exc()
 
-    with open(file_path, "w") as file:
+    with open(file_path, "w", encoding='utf-8') as file:
         file.write("failed")
     return
 
@@ -591,7 +619,7 @@ async def vet_answer_relevance_loop(
             )
         else:
             print("Answer relevancy validation failed! Tossing")
-            with open(file_path, "w") as file:
+            with open(file_path, "w", encoding='utf-8') as file:
                     file.write("failed")
             return
     except Exception as e:
@@ -599,36 +627,60 @@ async def vet_answer_relevance_loop(
         print(e)
         traceback.print_exc()
 
-    with open(file_path, "w") as file:
+    with open(file_path, "w", encoding='utf-8') as file:
         file.write("failed")
     return
 
 
 def parse_validation_step(response):
+    return analyze_responses(response)
+    # For debug, save response to file
+
+    # log_file_path = os.path.join(obj_conf["PATH"]["OUTPUT"], "validation_responses.jsonl")
+    
+    # # Create a log entry with timestamp
+    # log_entry = {
+    #     "timestamp": datetime.datetime.now().isoformat(),
+    #     "response": response
+    # }
+    
+    # # Append the response to the log file
+    # with open(log_file_path, "a", encoding='utf-8') as f:
+    #     f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
     # print("!!! RESPONSE !!!")
     # print(response)
-    decision_pattern = re.compile(r"Critical Evaluation and Final Judgment:(.+)", re.DOTALL | re.IGNORECASE)
-    determination = decision_pattern.search(response).group(1).strip()
+    # decision_pattern = re.compile(r"Critical Evaluation and Final Judgment:(.+)", re.DOTALL | re.IGNORECASE) #original
+    # determination = decision_pattern.search(response).group(1).strip()
     # print("!!! DETERMINATION !!!")
     # print(determination)
-    if (
-        "irrelevant" in determination.lower()
-        or "Irrelevant" in determination.lower()
-        or "mostly" in determination.lower()
-        or "partial" in determination.lower()
-        or "introduces information not present in the text" in determination.lower()
-    ):
-        return (
-            False,
-            response,
-        )  # TODO ensure that in the control flow code it passes on (False, response), completion
-    elif "relevant" in determination.lower():
-        return (True, response)  # TODO same as above(True, response), completion
-    else:
-        print("Did not contain relevant or irrelevant! Retrying")
-        raise Exception(
-            "Validation step screwed up and did not reach a conclusion! Retrying!"
-        )
+    # Make the pattern more flexible to match different formats
+    # decision_pattern = re.compile(r'(?:Final Judgment|Final Answer:|Conclusion)\s*(Relevant|Irrelevant)', re.IGNORECASE)
+    # sentence = analyze_responses(response)
+    # # Add error handling for when pattern isn't found
+    # match = decision_pattern.search(sentence)
+    # if match is None:
+    #     raise ValueError("Could not find 'Final Judgment' or 'Final Answer' in response")
+    
+    # determination = match.group(1).strip()
+    # if (
+    #     "irrelevant" in determination.lower()
+    #     or "Irrelevant" in determination.lower()
+    #     or "mostly" in determination.lower()
+    #     or "partial" in determination.lower()
+    #     or "introduces information not present in the text" in determination.lower()
+    # ):
+    #     return (
+    #         False,
+    #         response,
+    #     )  # TODO ensure that in the control flow code it passes on (False, response), completion
+    # elif "relevant" in determination.lower():
+    #     return (True, response)  # TODO same as above(True, response), completion
+    # else:
+    #     print("Did not contain relevant or irrelevant! Retrying")
+    #     raise Exception(
+    #         "Validation step screwed up and did not reach a conclusion! Retrying!"
+    #     )
+
 
 
 async def vet_question_loop( # NOTE adding the pipelinestep class would make this a bit more complex, rather than less; so this is not refactored to use that class
@@ -644,7 +696,7 @@ async def vet_question_loop( # NOTE adding the pipelinestep class would make thi
     try:
         file_path = os.path.join(qa_dicts_dir, f"para_{qa_dict['paragraph_idx']}_q_{qa_dict['question_idx']}.json")
         if os.path.exists(file_path):
-            with open(file_path, "r") as file:
+            with open(file_path, "r", encoding='utf-8') as file:
                 file_body = file.read()
                 if file_body == "failed":
                     qa_dict = None
@@ -719,7 +771,7 @@ async def vet_question_loop( # NOTE adding the pipelinestep class would make thi
                 
                 vetted_qa_dicts.append(res)
                 if res is not None:
-                    with open(file_path, "w") as file:
+                    with open(file_path, "w", encoding='utf-8') as file:
                         json.dump(res, file, indent=4)
                 return 
             while times_checked < double_check_counter:
@@ -783,19 +835,19 @@ async def vet_question_loop( # NOTE adding the pipelinestep class would make thi
                 
                 vetted_qa_dicts.append(res)
                 if res is not None:
-                    with open(file_path, "w") as file:
+                    with open(file_path, "w", encoding='utf-8') as file:
                         json.dump(res, file, indent=4)
                 return
             else: # this path is probably redundant
                 print("Question accuracy validation failed! Tossing")
-                with open(file_path, "w") as file:
+                with open(file_path, "w", encoding='utf-8') as file:
                     file.write("failed")
                 return
         except Exception as e:
             print("!!ERROR!!")
             print(e)
             traceback.print_exc()
-        with open(file_path, "w") as file:
+        with open(file_path, "w", encoding='utf-8') as file:
             file.write("failed")
     except Exception as e:
         print(f"Q ERROR: {e}")
@@ -870,7 +922,7 @@ class QuestionGenerationStep(PipelineStep): # like before, but with the new syst
         if len(existing_files) > 0:
             print(f"Skipping para_{idx} as files already exist; loading said files")
             for file_path in existing_files:
-                with open(file_path, "r") as file:
+                with open(file_path, "r", encoding='utf-8') as file:
                     qa_dict = json.load(file)
                 output_list.append(qa_dict)
             return True
@@ -902,7 +954,7 @@ class QuestionGenerationStep(PipelineStep): # like before, but with the new syst
         os.makedirs(self.save_path_dir, exist_ok=True)
         for qdict in qdicts:
             file_path = os.path.join(self.save_path_dir, f"para_{idx}_q_{qdict['question_idx']}.json")
-            with open(file_path, "w") as file:
+            with open(file_path, "w", encoding='utf-8') as file:
                 json.dump(qdict, file, indent=4)
 
 question_generation_step = QuestionGenerationStep() 
@@ -1000,7 +1052,7 @@ class JudgeParagraphStep(PipelineStep):
         save_path_file = self.make_save_path_file(idx)
         
         if os.path.isfile(save_path_file):
-            with open(save_path_file, "r") as f:
+            with open(save_path_file, "r", encoding='utf-8') as f:
                 try:
                     data = json.load(f)
                 except json.JSONDecodeError:
@@ -1036,7 +1088,7 @@ class JudgeParagraphStep(PipelineStep):
                 "metadata": input_data["metadata"]
             }
             output_list.append(output_data)
-            with open(save_path_file, "w") as f:
+            with open(save_path_file, "w", encoding='utf-8') as f:
                 metadata = input_data["metadata"]
                 f.write(f"failed|{metadata}")
             print(f"DEBUG model decided that index {idx} was not suitable")
@@ -1048,7 +1100,7 @@ class JudgeParagraphStep(PipelineStep):
             }
             output_list.append(output_data)
             os.makedirs(os.path.dirname(save_path_file), exist_ok=True)
-            with open(save_path_file, "w") as f:
+            with open(save_path_file, "w", encoding='utf-8') as f:
                 json.dump(output_data, f)
             print(f"DEBUG model decided that index {idx} was suitable")
             print(f"Saved to {save_path_file}")
@@ -1171,22 +1223,13 @@ def convert_directory_to_list(directory_path):
     for filename in os.listdir(directory_path):  # for each file
         if filename.endswith(".json"):  # if it's a conversation file
             filepath = os.path.join(directory_path, filename)  # get the path
-            with open(filepath, "r") as file:  # open it
+            with open(filepath, "r", encoding='utf-8') as file:  # open it
                 try:
                     data_dict = json.load(file)  # load its data
                     master_list.append(
                         data_dict
                     )  # append it as-is to the master-list
-                except Exception as e:
-                    print(f"Error reading filename: {e}")
-    
-    # We do the master list first, entirely. So that we can pick from it later down here.
-    for filename in os.listdir(directory_path):  # for each file
-        if filename.endswith(".json"):  # if it's a conversation file
-            filepath = os.path.join(directory_path, filename)  # get the path
-            with open(filepath, "r") as file:  # open it
-                try:
-                    data_dict = json.load(file)  # load its data
+
                     dialogues = process_multiturn_functions.extract_conversation(
                         data_dict["conversation"]
                     )
@@ -1198,17 +1241,11 @@ def convert_directory_to_list(directory_path):
                     simplified_conversations_rag = []
 
                     system_prompt_rag = random.choice(FINAL_ASSISTANT_PROMPTS_RAG)
-                    if random.random() < RAG_FAILURE_PERCENTAGE:
-                        # set paragraph to a random one from the list
-                        # data_dict['dict_list'][0]["paragraph"] = random.choice(data_dict['dict_list'])["paragraph"]
-                        paragraph = random.choice(master_list)['dict_list'][0]["paragraph"]
-                    else:
-                        paragraph = data_dict['dict_list'][0]["paragraph"]
                     simplified_conversations_rag.append(
                         {
                             "from": "system",
                             "value": system_prompt_rag.replace(
-                                "{data}", paragraph
+                                "{data}", data_dict['dict_list'][0]["paragraph"]
                             ),
                         }
                     )
@@ -1264,21 +1301,25 @@ def convert_directory_to_list(directory_path):
     
         # Write the master list to a new .jsonl file
     write_1 = obj_conf["PATH"]["OUTPUT"] + "/master_list.jsonl"
-    with open(write_1, "w") as file:
+    with open(write_1, "w", encoding='utf-8') as file:
         for item in master_list:
-            file.write(json.dumps(item, ensure_ascii=False) + "\n")
+            json.dump(item, file, ensure_ascii=False)
+            file.write("\n")
+            # file.write(json.dumps(item, ensure_ascii=False) + "\n")   #orginal way
 
     # Process and push simplified_list (no RAG)
     write_2 = obj_conf["PATH"]["OUTPUT"] + "/simplified_data_no_rag.jsonl"
-    with open(write_2, "w") as file:
+    with open(write_2, "w", encoding='utf-8') as file:
         for item in simplified_list:
-            file.write(json.dumps(item, ensure_ascii=False) + "\n")
+            json.dump(item, file, ensure_ascii=False)
+            file.write("\n")
+            # file.write(json.dumps(item, ensure_ascii=False) + "\n")   #original way
             
 
     if PUSH_TO_HUB:
         # Create a temporary JSON file with train split
         temp_file_no_rag = obj_conf["PATH"]["OUTPUT"] + "/temp_simplified_data_no_rag.json"
-        with open(temp_file_no_rag, 'w') as temp_file:
+        with open(temp_file_no_rag, 'w', encoding='utf-8') as temp_file:
             json.dump({"train": simplified_list}, temp_file)
         
         # Load the dataset from the temporary file
@@ -1292,18 +1333,23 @@ def convert_directory_to_list(directory_path):
 
     # Process and push simplified_rag_list (RAG)
     write_3 = obj_conf["PATH"]["OUTPUT"] + "/simplified_data_rag.jsonl"
-    with open(write_3, "w") as file:
+    with open(write_3, "w", encoding='utf-8') as file:
         for item in simplified_rag_list:
-            file.write(json.dumps(item, ensure_ascii=False) + "\n")
+            json.dump(item, file, ensure_ascii=False)
+            file.write("\n")
+            # file.write(json.dumps(item, ensure_ascii=False) + "\n")   #original way
             
     write_4 = obj_conf["PATH"]["OUTPUT"] + "/plain_qa_list.jsonl"
-    with open(write_4, "w") as file:
+    with open(write_4, "w", encoding='utf-8') as file:
         for item in plain_qa_list:
-            file.write(json.dumps(item, ensure_ascii=False) + "\n")
+            json.dump(item, file, ensure_ascii=False)
+            file.write("\n")
+            # file.write(json.dumps(item, ensure_ascii=False) + "\n")   #original way
+            
     if PUSH_TO_HUB:
         # Create a temporary JSON file with train split
         temp_file_plain = obj_conf["PATH"]["OUTPUT"] + "/temp_plain_qa_list.json"
-        with open(temp_file_plain, 'w') as temp_file:
+        with open(temp_file_plain, 'w', encoding='utf-8') as temp_file:
             json.dump({"train": plain_qa_list}, temp_file)
         
         # Load the dataset from the temporary file
@@ -1318,7 +1364,7 @@ def convert_directory_to_list(directory_path):
     if PUSH_TO_HUB:
         # Create a temporary JSON file with train split
         temp_file_rag = obj_conf["PATH"]["OUTPUT"] + "/temp_simplified_data_rag.json"
-        with open(temp_file_rag, 'w') as temp_file:
+        with open(temp_file_rag, 'w', encoding='utf-8') as temp_file:
             json.dump({"train": simplified_rag_list}, temp_file)
         
         # Load the dataset from the temporary file
@@ -1331,7 +1377,7 @@ def convert_directory_to_list(directory_path):
         os.remove(temp_file_rag)
 
     print(
-        f"Conversion complete. Master list written to {write_1}. Simplified data written to {write_2} (no RAG) and {write_3} (RAG). No-nonsense QA data written to {write_4}."
+        f"Conversion complete. \n Master list: {write_1}. \n Simplified data: {write_2} (no RAG) and {write_3} (RAG). \n No-nonsense QA data: {write_4}."
     )
     if PUSH_TO_HUB:
         print("Data successfully pushed to Hugging Face Hub.")
@@ -1362,18 +1408,18 @@ def save_plain_qatuples(qa_dicts_by_text):
     
         # Write the master list to a new .jsonl file
     write_1 = obj_conf["PATH"]["OUTPUT"] + "/master_list.jsonl"
-    with open(write_1, "w") as file:
+    with open(write_1, "w", encoding='utf-8') as file:
         for item in master_list:
             file.write(json.dumps(item, ensure_ascii=False) + "\n")
             
     write_2 = obj_conf["PATH"]["OUTPUT"] + "/plain_qa_list.jsonl"
-    with open(write_2, "w") as file:
+    with open(write_2, "w", encoding='utf-8') as file:
         for item in plain_qa_list:
             file.write(json.dumps(item, ensure_ascii=False) + "\n")
     if PUSH_TO_HUB:
         # Create a temporary JSON file with train split
         temp_file_plain = obj_conf["PATH"]["OUTPUT"] + "/temp_plain_qa_list.json"
-        with open(temp_file_plain, 'w') as temp_file:
+        with open(temp_file_plain, 'w', encoding='utf-8') as temp_file:
             json.dump({"train": plain_qa_list}, temp_file)
         
         # Load the dataset from the temporary file

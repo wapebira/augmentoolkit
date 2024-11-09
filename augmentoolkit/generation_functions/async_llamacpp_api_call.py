@@ -9,6 +9,7 @@ async def make_async_api_call(
     # Determine the endpoint based on the presence of messages
     if messages is not None:
         endpoint = "/v1/chat/completions"
+
         data = json.dumps(
             {
                 "messages": messages,

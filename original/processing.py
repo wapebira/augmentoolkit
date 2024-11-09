@@ -42,7 +42,7 @@ async def main():
     import glob
     from original import steps
     config_path = os.environ["CONFIG_PATH"]
-    with open(config_path, "r") as f:
+    with open(config_path, "r", encoding='utf-8') as f:
         config = yaml.safe_load(f)
 
     if not os.path.exists(config["PATH"]["OUTPUT"]):
@@ -410,7 +410,7 @@ async def main():
         
     # Yay! Now you have a dataset!
     
-    with open(config["PATH"]["OUTPUT"] + "/master_list.jsonl", "r") as f:
+    with open(config["PATH"]["OUTPUT"] + "/master_list.jsonl", "r", encoding='utf-8') as f:
         data = [json.loads(line) for line in f]
 
     # For curiosity's sake, you can find out how many lines of dialogue you generated
