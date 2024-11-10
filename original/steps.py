@@ -22,7 +22,8 @@ import traceback
 import glob
 import yaml
 from datasets import load_dataset
-import ruamel.yaml
+from nltk.tokenize import sent_tokenize
+import nltk
 
 
 from augmentoolkit.utils.create_conv_starter import create_conv_starter
@@ -633,7 +634,45 @@ async def vet_answer_relevance_loop(
 
 
 def parse_validation_step(response):
-    return analyze_responses(response)
+     # Split into sentences
+    sentences = sent_tokenize(response)
+            
+    # Search from end to beginning
+    total_sentences = len(sentences)
+            
+    # Iterate through sentences in reverse order
+    for i in range(total_sentences - 1, -1, -1):
+        sentence = sentences[i]
+        found_word = None
+        if "Relevant" in sentence:
+            found_word = "Relevant"
+        elif "Irrelevant" in sentence:
+            found_word = "Irrelevant"
+                
+        if found_word:
+            # Calculate sentence position from end of response
+            position_from_end = -(total_sentences - i)
+            if position_from_end < -2:  # If not found in last 2 sentences  
+                return (False, response)
+            else:
+                if (
+                    "irrelevant" in sentence.lower()
+                    or "Irrelevant" in sentence.lower()
+                    or "mostly" in sentence.lower()
+                    or "partial" in sentence.lower()
+                    or "introduces information not present in the text" in sentence.lower()
+                ):
+                    return (
+                        False,
+                        response,
+                    )  # TODO ensure that in the control flow code it passes on (False, response), completion
+                elif "relevant" in sentence.lower():
+                    return (True, response)  # TODO same as above(True, response), completion
+                else:
+                    print("Did not contain relevant or irrelevant! Retrying")
+                    raise Exception(
+                        "Validation step screwed up and did not reach a conclusion! Retrying!"
+                    )
     # For debug, save response to file
 
     # log_file_path = os.path.join(obj_conf["PATH"]["OUTPUT"], "validation_responses.jsonl")
